@@ -17,6 +17,7 @@
 (require 'json)
 (require 'url)
 (require 'auth-source)
+(require 'subr-x)
 
 ;; Conditional requires
 (declare-function efrit-tools-eval-sexp "efrit-tools")
@@ -371,8 +372,7 @@ Work step-by-step until the goal is achieved.")
   (lambda (status)
     (efrit-agent--log "DEBUG" "Callback invoked with status: %s" status)
     (condition-case err
-        (let* ((headers (save-current-buffer (current-buffer)
-                          (save-excursion (efrit-agent--parse-response-headers))))
+        (let* ((headers (efrit-agent--parse-response-headers))
                (req-id (or (efrit-agent--header headers "request-id") ""))
                (content (efrit-agent--parse-api-response (current-buffer))))
           (if content
