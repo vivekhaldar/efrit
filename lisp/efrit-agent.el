@@ -59,6 +59,27 @@
   :type 'integer
   :group 'efrit-agent)
 
+;; Retry / backoff configuration
+(defcustom efrit-agent-max-retries 5
+  "Maximum number of retries for retryable HTTP errors (e.g., 429/5xx/529)."
+  :type 'integer
+  :group 'efrit-agent)
+
+(defcustom efrit-agent-retry-initial-delay 1.5
+  "Initial backoff delay in seconds before the first retry."
+  :type 'number
+  :group 'efrit-agent)
+
+(defcustom efrit-agent-retry-multiplier 2.0
+  "Backoff multiplier applied to the delay for each attempt."
+  :type 'number
+  :group 'efrit-agent)
+
+(defcustom efrit-agent-retry-jitter 0.25
+  "Jitter proportion (0.0-1.0) to randomize retry delays."
+  :type 'number
+  :group 'efrit-agent)
+
 (defcustom efrit-agent-debug t
   "Enable debug logging for agent operations."
   :type 'boolean
@@ -236,10 +257,58 @@ Work step-by-step until the goal is achieved.")
                     (let ((body-text (buffer-substring-no-properties (point) (point-max))))
                       (efrit-agent--log "DEBUG" "Response body length: %d characters" (length body-text))
                       (cons t body-text)))
-                (efrit-agent--log "ERROR" "HTTP error %d" status-code)
-                (cons nil (format "HTTP error %d" status-code))))
+                ;; Return body as well so caller can parse error JSON
+                (goto-char header-end)
+                (let ((body-text (buffer-substring-no-properties (point) (point-max))))
+                  (efrit-agent--log "ERROR" "HTTP error %d" status-code)
+                  (cons nil (cons status-code body-text)))))
           (efrit-agent--log "ERROR" "Invalid HTTP response format")
           (cons nil "Invalid HTTP response format"))))))
+
+;; Helper: parse headers from current buffer
+(defun efrit-agent--parse-response-headers ()
+  "Return an alist of HTTP headers from the current buffer. Assumes point at buffer start."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((headers '()))
+      (when (re-search-forward "\n\n" nil t)
+        (save-restriction
+          (narrow-to-region (point-min) (match-beginning 0))
+          (goto-char (point-min))
+          (forward-line 1) ;; skip status line
+          (while (looking-at "^\([^:]+\):[ \t]*\(.*\)$")
+            (let ((k (downcase (match-string 1)))
+                  (v (string-trim (match-string 2))))
+              (push (cons k v) headers))
+            (forward-line 1))))
+      (nreverse headers)))
+
+(defun efrit-agent--header (headers name)
+  "Get header NAME (case-insensitive) from HEADERS alist."
+  (alist-get (downcase name) headers nil nil #'string=))
+
+;; Retry policy helpers
+(defun efrit-agent--retryable-status-p (status-code headers)
+  "Return non-nil if STATUS-CODE is retryable given HEADERS."
+  (let* ((retryable (member status-code '(408 409 425 429 500 502 503 504 520 522 524 529)))
+         (should-retry (efrit-agent--header headers "x-should-retry")))
+    (or retryable (and should-retry (string-match-p "^t\(rue\)?$" (downcase should-retry))))))
+
+(defun efrit-agent--compute-retry-delay (attempt headers)
+  "Compute delay seconds for ATTEMPT using headers (honors Retry-After)."
+  (let* ((retry-after (efrit-agent--header headers "retry-after"))
+         (retry-after-secs (when retry-after (ignore-errors (string-to-number retry-after))))
+         (base (if (and retry-after-secs (> retry-after-secs 0))
+                   retry-after-secs
+                 (* efrit-agent-retry-initial-delay (expt efrit-agent-retry-multiplier (max 0 (1- attempt))))))
+         (jitter-factor (if (and (numberp efrit-agent-retry-jitter) (> efrit-agent-retry-jitter 0))
+                            (let* ((r (random 1000000))
+                                   (u (/ (float r) 1000000.0))
+                                   (low (- 1.0 efrit-agent-retry-jitter))
+                                   (high (+ 1.0 efrit-agent-retry-jitter)))
+                              (+ low (* u (- high low))))
+                          1.0)))
+    (* base jitter-factor)))
 
 (defun efrit-agent--parse-api-response (response-buffer)
   "Parse Claude API response from RESPONSE-BUFFER and extract content."
@@ -282,28 +351,56 @@ Work step-by-step until the goal is achieved.")
              (kill-buffer response-buffer)
              nil)))
       
-      ;; HTTP validation failed
-      (efrit-agent--log "ERROR" "HTTP validation failed: %s" (cdr validation))
-      (kill-buffer response-buffer)
-      nil)))
+      ;; HTTP validation failed; attempt to parse error JSON body for better diagnostics
+      (let* ((err (cdr validation)))
+        (cond
+         ((and (consp err) (integerp (car err)))
+          (let* ((status (car err))
+                 (body (cdr err)))
+            (efrit-agent--log "ERROR" "HTTP validation failed: %s" (format "HTTP %d" status))
+            (efrit-agent--log-response (or body ""))
+            (kill-buffer response-buffer)
+            nil))
+         (t
+          (efrit-agent--log "ERROR" "HTTP validation failed: %s" err)
+          (kill-buffer response-buffer)
+          nil))))))
 
-(defun efrit-agent--consult-llm-callback (session callback-fn)
-  "Callback function to handle LLM response for SESSION."
+(defun efrit-agent--consult-llm-callback (session prompt callback-fn attempt)
+  "Callback to handle LLM response with retry logic for SESSION and PROMPT."
   (lambda (status)
     (efrit-agent--log "DEBUG" "Callback invoked with status: %s" status)
     (condition-case err
-        (let ((content (efrit-agent--parse-api-response (current-buffer))))
+        (let* ((headers (save-current-buffer (current-buffer)
+                          (save-excursion (efrit-agent--parse-response-headers))))
+               (req-id (or (efrit-agent--header headers "request-id") ""))
+               (content (efrit-agent--parse-api-response (current-buffer))))
           (if content
               (progn
-                (efrit-agent--log "INFO" "Successfully parsed API response")
+                (efrit-agent--log "INFO" "Successfully parsed API response (request-id=%s)" req-id)
                 (funcall callback-fn session content nil))
-            (efrit-agent--log "ERROR" "Failed to parse API response")
-            (funcall callback-fn session nil "Failed to parse API response")))
+            ;; No content; inspect status & headers to decide retry
+            (save-excursion
+              (goto-char (point-min))
+              (let* ((status-code (when (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
+                                    (string-to-number (match-string 1))))
+                     (retryable (and status-code (efrit-agent--retryable-status-p status-code headers))))
+                (if (and retryable (< attempt efrit-agent-max-retries))
+                    (let* ((next-attempt (1+ attempt))
+                           (delay (efrit-agent--compute-retry-delay next-attempt headers)))
+                      (efrit-agent--log "INFO" "Retrying HTTP %s (request-id=%s) in %.2fs (%d/%d)." 
+                                        (or status-code "?") req-id delay next-attempt efrit-agent-max-retries)
+                      (message "Efrit Agent: API busy, retrying in %.1fs (%d/%d)" delay next-attempt efrit-agent-max-retries)
+                      (let ((buf (current-buffer)))
+                        (when (buffer-live-p buf) (kill-buffer buf)))
+                      (run-at-time delay nil #'efrit-agent--consult-llm-async session prompt callback-fn next-attempt))
+                  (efrit-agent--log "ERROR" "Failed to parse API response (request-id=%s). Status=%s. Not retrying." req-id (or status-code "?"))
+                  (funcall callback-fn session nil (format "HTTP error %s (request-id=%s)" (or status-code "?") req-id))))))
       (error
        (efrit-agent--log "ERROR" "Callback error: %s" (error-message-string err))
        (funcall callback-fn session nil (format "Callback error: %s" (error-message-string err)))))))
 
-(defun efrit-agent--consult-llm-async (session prompt callback-fn)
+(defun efrit-agent--consult-llm-async (session prompt callback-fn &optional attempt)
   "Send PROMPT to LLM backend asynchronously and call CALLBACK-FN with result."
   (efrit-agent--log "INFO" "Starting API request to Claude")
   (condition-case api-err
@@ -342,8 +439,10 @@ Work step-by-step until the goal is achieved.")
             (efrit-agent--log "DEBUG" "Model: %s, Max tokens: %d" efrit-agent-model efrit-agent-max-tokens)
             (efrit-agent--log "INFO" "Sending request to %s" efrit-agent-api-url)
             
-            (url-retrieve efrit-agent-api-url 
-                          (efrit-agent--consult-llm-callback session callback-fn)))))
+            (let ((attempt-n (or attempt 0)))
+              (efrit-agent--log "DEBUG" "Attempt %d/%d" attempt-n efrit-agent-max-retries)
+              (url-retrieve efrit-agent-api-url 
+                            (efrit-agent--consult-llm-callback session prompt callback-fn attempt-n)))))
     (error
      (efrit-agent--log "ERROR" "API setup error: %s" (error-message-string api-err))
      (funcall callback-fn session nil (format "API setup error: %s" (error-message-string api-err))))))
